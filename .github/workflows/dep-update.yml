@@ -1,15 +1,12 @@
 name: Dependency Update Check
-
 on:
   schedule:
     # Every Monday at 09:00 UTC
     - cron: "0 9 * * 1"
   workflow_dispatch:
-
 permissions:
   contents: write
-  pull-requests: write
-
+  issues: write
 jobs:
   check-updates:
     name: Check for new versions
@@ -19,20 +16,16 @@ jobs:
         with:
           submodules: recursive
           fetch-depth: 0
-
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
-
       - name: Snapshot current lock file
         run: cp datapack_depends.lock datapack_depends.lock.old 2>/dev/null || true
-
       # resolve hits GitHub API — token required
       - name: Resolve in prod mode (updates lock)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: python scripts/dp-resolve.py resolve --mode prod
-
       - name: Check if lock changed
         id: diff
         run: |
@@ -44,12 +37,10 @@ jobs:
             echo "New versions detected:"
             diff datapack_depends.lock.old datapack_depends.lock || true
           fi
-
       - name: List updated dependencies
         if: steps.diff.outputs.changed == 'true'
         run: python scripts/dp-resolve.py check
-
-      - name: Open PR if changed
+      - name: Push branch and open issue (PR creation blocked by org policy)
         if: steps.diff.outputs.changed == 'true'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -62,11 +53,21 @@ jobs:
           git commit -m "chore(deps): update lock file ($(date +%Y-%m-%d))"
           git push origin "$BRANCH"
 
-          gh pr create \
-            --title "chore(deps): dependency update $(date +%Y-%m-%d)" \
-            --body "Scheduled dependency check — lock file updated.
+          REPO="${GITHUB_REPOSITORY}"
+          COMPARE_URL="https://github.com/${REPO}/compare/main...${BRANCH}?expand=1"
+          DIFF_CONTENT=$(diff datapack_depends.lock.old datapack_depends.lock || true)
 
-          Review the diff, test locally, then merge." \
-            --base main \
-            --head "$BRANCH" \
+          gh issue create \
+            --title "chore(deps): dependency update $(date +%Y-%m-%d)" \
+            --body "Scheduled dependency check — lock file updated on branch \`${BRANCH}\`.
+
+          PR'ı GitHub Actions açamıyor (org policy: \"Allow GitHub Actions to create and approve pull requests\" kapalı). Aşağıdaki linke tıklayıp PR'ı manuel oluştur:
+
+          ${COMPARE_URL}
+
+          \`\`\`diff
+          ${DIFF_CONTENT}
+          \`\`\`
+
+          Review the diff, test locally, then create the PR via the link above." \
             --label "dependencies"
