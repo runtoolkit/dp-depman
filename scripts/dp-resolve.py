@@ -322,18 +322,22 @@ def build_separate_zips(cfg: dict, resolved: dict, root: Path, token: str | None
     out = root / OUTPUT_DIR
     out.mkdir(parents=True, exist_ok=True)
 
+    # Bug 3 fix: use clean dep_id-version.zip name, not the cache filename
     for dep_id, info in resolved.items():
         dep_zip = get_dep_zip(dep_id, info, root, token)
-        dest = out / dep_zip.name
+        dest = out / f"{dep_id}-{info['version']}.zip"
         shutil.copy2(dep_zip, dest)
         log(f"  Copied: {dest.name}")
 
+    # Bug 1+2 fix: zip from pack_root so pack.mcmeta is at ZIP root,
+    # and only include datapack files (pack.mcmeta + data/)
+    pack_root = _get_pack_root(cfg, root)
     pack_zip_name = f"{cfg['id']}-{cfg['version']}.zip"
     pack_zip_path = out / pack_zip_name
     with zipfile.ZipFile(pack_zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-        for file in root.rglob("*"):
-            if file.is_file() and not _should_exclude(file, root):
-                zf.write(file, file.relative_to(root))
+        for file in pack_root.rglob("*"):
+            if file.is_file() and not _should_exclude(file, pack_root):
+                zf.write(file, file.relative_to(pack_root))
     log(f"Main pack: {pack_zip_path.name}")
 
 def build_merged_zip(cfg: dict, resolved: dict, root: Path, token: str | None):
@@ -361,10 +365,11 @@ def build_merged_zip(cfg: dict, resolved: dict, root: Path, token: str | None):
                         seen_files[name] = dep_id
                     zf.writestr(name, dep_zip.read(name))
 
-        # Main pack overrides dependencies
-        for file in root.rglob("*"):
-            if file.is_file() and not _should_exclude(file, root):
-                arc_name = str(file.relative_to(root))
+        # Main pack overrides dependencies — zip from pack_root (Bug 1+2 fix)
+        pack_root = _get_pack_root(cfg, root)
+        for file in pack_root.rglob("*"):
+            if file.is_file() and not _should_exclude(file, pack_root):
+                arc_name = str(file.relative_to(pack_root))
                 seen_files[arc_name] = f"{cfg['id']} (override)"
                 zf.write(file, arc_name)
 
@@ -375,14 +380,33 @@ def build_merged_zip(cfg: dict, resolved: dict, root: Path, token: str | None):
 
     log(f"Merged ZIP: {merged_path.name}")
 
+def _get_pack_root(cfg: dict, root: Path) -> Path:
+    """
+    Return the directory that contains pack.mcmeta.
+    Checks config 'pack_root' field first, then searches for pack.mcmeta,
+    then falls back to root itself.
+    """
+    # Explicit config override
+    if "pack_root" in cfg:
+        return root / cfg["pack_root"]
+
+    # Search for pack.mcmeta one level deep
+    for candidate in [root] + list(root.iterdir()):
+        if candidate.is_dir() and (candidate / "pack.mcmeta").exists():
+            if candidate != root:
+                log(f"Pack root detected: {candidate.relative_to(root)}/")
+            return candidate
+
+    return root
+
 def _should_exclude(file: Path, root: Path) -> bool:
     rel   = file.relative_to(root)
     parts = rel.parts
-    excluded = {
-        ".git", ".github", ".dp-cache", "dist",
-        "node_modules", "__pycache__",
-        CONFIG_FILE, LOCK_FILE,
-    }
+    # Only include pack.mcmeta and data/ — everything else is repo metadata
+    allowed_roots = {"data", "pack.mcmeta"}
+    if parts[0] not in allowed_roots:
+        return True
+    excluded = {".git", ".github", ".dp-cache", "dist", "__pycache__"}
     return parts[0] in excluded or parts[0].startswith(".")
 
 # ─── Submodule init helper ────────────────────────────────────────────────────
