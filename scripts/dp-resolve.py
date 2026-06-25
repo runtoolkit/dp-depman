@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """
 dp-resolve.py — Datapack Dependency Resolver
-Source: GitHub Releases (prod) or Git Submodule (dev)
-Output: Separate ZIPs or single merged ZIP
+Reads dependency declarations from .depends/<dep_id>.json files.
+Falls back to legacy datapack_depends.json if .depends/ is absent.
+
+Source:  GitHub Releases (prod) or Git Submodule (dev)
+Output:  Separate ZIPs or single merged ZIP
 """
 
 import argparse
 import hashlib
-import json
 import os
 import re
 import shutil
@@ -17,13 +19,13 @@ import urllib.request
 import zipfile
 from pathlib import Path
 
-# ─── Constants ────────────────────────────────────────────────────────────────
-
-CONFIG_FILE   = "datapack_depends.json"
-LOCK_FILE     = "datapack_depends.lock"
-CACHE_DIR     = Path(".dp-cache")
-OUTPUT_DIR    = Path("dist")
-SUBMODULE_DIR = Path("deps")
+# Import shared helpers
+sys.path.insert(0, str(Path(__file__).parent))
+from _dp_common import (
+    CACHE_DIR, DEPENDS_DIR, LOCK_FILE, OUTPUT_DIR, SUBMODULE_DIR,
+    load_manifest, load_all_deps, load_lock, save_lock,
+    log, warn, die,
+)
 
 # ─── Version comparison ───────────────────────────────────────────────────────
 
@@ -35,7 +37,7 @@ def parse_version(v: str) -> tuple[int, ...]:
         try:
             result.append(int(p))
         except ValueError:
-            pass  # ignore pre-release suffixes
+            pass
     return tuple(result)
 
 def version_matches(version: str, constraint: str) -> bool:
@@ -43,77 +45,39 @@ def version_matches(version: str, constraint: str) -> bool:
     Supported constraint formats:
       "1.2.3"    → exact match
       ">=1.2.0"  → minimum version
-      "1.2.x"    → wildcard (major.minor fixed)
-      "^1.2.0"   → major fixed, minor+patch free
-      "~1.2.0"   → major+minor fixed, patch free
+      "1.2.x"    → wildcard patch
+      "^1.2.0"   → major fixed
+      "~1.2.0"   → major+minor fixed
     """
     version = version.lstrip("v")
     v = parse_version(version)
 
     if re.match(r"^\d+\.\d+(\.\d+)*$", constraint):
         return v == parse_version(constraint)
-
     if constraint.startswith(">="):
         return v >= parse_version(constraint[2:])
-
     if constraint.startswith("<="):
         return v <= parse_version(constraint[2:])
-
     if constraint.startswith(">") and not constraint.startswith(">="):
         return v > parse_version(constraint[1:])
-
     if constraint.startswith("<") and not constraint.startswith("<="):
         return v < parse_version(constraint[1:])
-
     if re.match(r"^\d+\.\d+\.x$", constraint):
         base = parse_version(constraint[:-2])
         return v[:2] == base[:2]
-
     if constraint.startswith("^"):
         base = parse_version(constraint[1:])
         return v[0] == base[0] and v >= base
-
     if constraint.startswith("~"):
         base = parse_version(constraint[1:])
         return v[:2] == base[:2] and v >= base
 
     raise ValueError(f"Unsupported constraint format: '{constraint}'")
 
-# ─── Config loading ───────────────────────────────────────────────────────────
-
-def load_config(path: Path) -> dict:
-    if not path.exists():
-        die(f"{CONFIG_FILE} not found: {path}")
-    with open(path) as f:
-        try:
-            cfg = json.load(f)
-        except json.JSONDecodeError as e:
-            die(f"JSON parse error: {e}")
-
-    for field in ("id", "version", "dependencies"):
-        if field not in cfg:
-            die(f"Missing required field: '{field}'")
-
-    return cfg
-
-# ─── Lock file ────────────────────────────────────────────────────────────────
-
-def load_lock(root: Path) -> dict:
-    lock_path = root / LOCK_FILE
-    if lock_path.exists():
-        with open(lock_path) as f:
-            return json.load(f)
-    return {"resolved": {}}
-
-def save_lock(root: Path, lock: dict):
-    lock_path = root / LOCK_FILE
-    with open(lock_path, "w") as f:
-        json.dump(lock, f, indent=2)
-    log(f"Lock file updated: {lock_path}")
-
 # ─── GitHub Releases resolution ───────────────────────────────────────────────
 
 def fetch_github_releases(owner: str, repo: str, token: str | None) -> list[dict]:
+    import json
     url = f"https://api.github.com/repos/{owner}/{repo}/releases"
     req = urllib.request.Request(url)
     req.add_header("Accept", "application/vnd.github+json")
@@ -129,16 +93,7 @@ def fetch_github_releases(owner: str, repo: str, token: str | None) -> list[dict
         die(f"Network error ({owner}/{repo}): {e.reason}")
 
 def resolve_github(dep_id: str, dep_cfg: dict, token: str | None) -> dict:
-    """
-    dep_cfg example:
-      {
-        "source": "github",
-        "repo": "runtoolkit/dataLib",
-        "version": ">=26.2.0",
-        "asset": "dataLib.zip"   ← optional; first .zip is used if omitted
-      }
-    """
-    repo   = dep_cfg["repo"]
+    repo         = dep_cfg["repo"]
     owner, repo_name = repo.split("/", 1)
     constraint   = dep_cfg["version"]
     wanted_asset = dep_cfg.get("asset")
@@ -174,16 +129,15 @@ def resolve_github(dep_id: str, dep_cfg: dict, token: str | None) -> dict:
             die(f"[{dep_id}] No ZIP asset found in v{chosen_ver}")
 
     return {
-        "source": "github",
-        "repo": repo,
-        "version": chosen_ver,
-        "asset_name": asset["name"],
+        "source":       "github",
+        "repo":         repo,
+        "version":      chosen_ver,
+        "asset_name":   asset["name"],
         "download_url": asset["browser_download_url"],
-        "sha256": None,
+        "sha256":       None,
     }
 
 def download_asset(url: str, dest: Path, token: str | None) -> str:
-    """Download file, return SHA-256 hex digest."""
     dest.parent.mkdir(parents=True, exist_ok=True)
     req = urllib.request.Request(url)
     if token:
@@ -199,15 +153,6 @@ def download_asset(url: str, dest: Path, token: str | None) -> str:
 # ─── Submodule resolution ─────────────────────────────────────────────────────
 
 def resolve_submodule(dep_id: str, dep_cfg: dict, root: Path) -> dict:
-    """
-    dep_cfg example:
-      {
-        "source": "submodule",
-        "path": "deps/dataLib",
-        "url": "https://github.com/runtoolkit/dataLib.git",
-        "version": ">=26.2.0"
-      }
-    """
     rel_path = dep_cfg.get("path", str(SUBMODULE_DIR / dep_id))
     abs_path = root / rel_path
 
@@ -217,26 +162,27 @@ def resolve_submodule(dep_id: str, dep_cfg: dict, root: Path) -> dict:
             f"  Run: git submodule add <url> {rel_path}"
         )
 
-    # Try to detect version from datapack_depends.json first, then pack.mcmeta
+    # Detect version: .depends/manifest.json → datapack_depends.json → pack.mcmeta
     detected_ver = "unknown"
-    dep_config_path = abs_path / CONFIG_FILE
-    if dep_config_path.exists():
+    for candidate in [
+        abs_path / DEPENDS_DIR / "manifest.json",
+        abs_path / "datapack_depends.json",
+        abs_path / "pack.mcmeta",
+    ]:
+        if not candidate.exists():
+            continue
         try:
-            with open(dep_config_path) as f:
-                dep_meta = json.load(f)
-            detected_ver = dep_meta.get("version", detected_ver)
+            import json
+            with open(candidate) as f:
+                data = json.load(f)
+            # manifest.json and datapack_depends.json use "version" directly
+            # pack.mcmeta nests it under "pack"
+            ver = data.get("version") or data.get("pack", {}).get("version")
+            if ver:
+                detected_ver = str(ver)
+                break
         except Exception:
-            pass
-
-    if detected_ver == "unknown":
-        mcmeta_path = abs_path / "pack.mcmeta"
-        if mcmeta_path.exists():
-            try:
-                with open(mcmeta_path) as f:
-                    meta = json.load(f)
-                detected_ver = meta.get("pack", {}).get("version", "unknown")
-            except Exception:
-                pass
+            continue
 
     constraint = dep_cfg.get("version", "*")
     if constraint != "*" and detected_ver != "unknown":
@@ -245,29 +191,22 @@ def resolve_submodule(dep_id: str, dep_cfg: dict, root: Path) -> dict:
                 die(
                     f"[{dep_id}] Version mismatch: "
                     f"submodule v{detected_ver} does not satisfy '{constraint}'\n"
-                    f"  Update submodule: git submodule update --remote {rel_path}"
+                    f"  Update: git submodule update --remote {rel_path}"
                 )
         except ValueError as e:
             warn(f"[{dep_id}] Constraint check skipped: {e}")
 
     log(f"  → {dep_id} submodule v{detected_ver} ({rel_path})")
-
-    return {
-        "source": "submodule",
-        "path": rel_path,
-        "version": detected_ver,
-    }
+    return {"source": "submodule", "path": rel_path, "version": detected_ver}
 
 # ─── Dependency resolution ────────────────────────────────────────────────────
 
-def resolve_all(cfg: dict, root: Path, mode: str, token: str | None) -> dict:
+def resolve_all(deps: dict, root: Path, mode: str, token: str | None) -> dict:
     """
     mode: "prod" → GitHub releases
           "dev"  → submodule
-          "auto" → determined by each dep's source field
+          "auto" → per-dep source field
     """
-    lock = load_lock(root)
-    deps = cfg.get("dependencies", {})
     if not deps:
         log("No dependencies declared.")
         return {}
@@ -277,14 +216,14 @@ def resolve_all(cfg: dict, root: Path, mode: str, token: str | None) -> dict:
         if isinstance(dep_cfg, str):
             dep_cfg = {"source": "auto", "version": dep_cfg}
 
-        source = dep_cfg.get("source", "auto")
-        effective_mode = mode
-        if effective_mode == "auto":
-            effective_mode = source if source in ("github", "submodule") else "prod"
+        source         = dep_cfg.get("source", "auto")
+        effective_mode = mode if mode != "auto" else (
+            source if source in ("github", "submodule") else "prod"
+        )
 
         if effective_mode == "prod" or source == "github":
             if "repo" not in dep_cfg:
-                die(f"[{dep_id}] Missing 'repo' field (required for prod mode)")
+                die(f"[{dep_id}] Missing 'repo' field (required for prod/github)")
             info = resolve_github(dep_id, dep_cfg, token)
         else:
             info = resolve_submodule(dep_id, dep_cfg, root)
@@ -296,9 +235,9 @@ def resolve_all(cfg: dict, root: Path, mode: str, token: str | None) -> dict:
 # ─── ZIP operations ───────────────────────────────────────────────────────────
 
 def get_dep_zip(dep_id: str, info: dict, root: Path, token: str | None) -> Path:
-    """Return the dependency ZIP path (from cache or downloaded)."""
+    """Return the dependency ZIP (from cache or download/pack)."""
     if info["source"] == "submodule":
-        src = root / info["path"]
+        src       = root / info["path"]
         cache_zip = CACHE_DIR / f"{dep_id}-{info['version']}-submodule.zip"
         cache_zip.parent.mkdir(parents=True, exist_ok=True)
         with zipfile.ZipFile(cache_zip, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -310,68 +249,76 @@ def get_dep_zip(dep_id: str, info: dict, root: Path, token: str | None) -> Path:
         cache_zip = CACHE_DIR / f"{dep_id}-{info['version']}-{info['asset_name']}"
         cache_zip.parent.mkdir(parents=True, exist_ok=True)
         if not cache_zip.exists():
-            sha = download_asset(info["download_url"], cache_zip, token)
+            sha          = download_asset(info["download_url"], cache_zip, token)
             info["sha256"] = sha
             log(f"  SHA-256: {sha}")
         else:
             log(f"  Using cached: {cache_zip.name}")
         return cache_zip
 
-def build_separate_zips(cfg: dict, resolved: dict, root: Path, token: str | None):
-    """Produce one ZIP per dependency plus the main pack ZIP."""
+def _get_pack_root(manifest: dict, root: Path) -> Path:
+    """
+    Locate the directory containing pack.mcmeta.
+    Priority: manifest 'pack_root' field → search one level deep → root.
+    """
+    if "pack_root" in manifest:
+        return root / manifest["pack_root"]
+
+    for candidate in [root] + [p for p in root.iterdir() if p.is_dir()]:
+        if (candidate / "pack.mcmeta").exists():
+            if candidate != root:
+                log(f"Pack root detected: {candidate.relative_to(root)}/")
+            return candidate
+
+    return root
+
+def _should_exclude(file: Path, pack_root: Path) -> bool:
+    """Only pack.mcmeta and data/ belong in the output ZIP."""
+    parts = file.relative_to(pack_root).parts
+    return parts[0] not in {"data", "pack.mcmeta"}
+
+def build_separate_zips(manifest: dict, resolved: dict, root: Path, token: str | None):
     out = root / OUTPUT_DIR
     out.mkdir(parents=True, exist_ok=True)
 
-    # Bug 3 fix: use clean dep_id-version.zip name, not the cache filename
     for dep_id, info in resolved.items():
         dep_zip = get_dep_zip(dep_id, info, root, token)
-        dest = out / f"{dep_id}-{info['version']}.zip"
+        dest    = out / f"{dep_id}-{info['version']}.zip"
         shutil.copy2(dep_zip, dest)
-        log(f"  Copied: {dest.name}")
+        log(f"  Dep ZIP: {dest.name}")
 
-    # Bug 1+2 fix: zip from pack_root so pack.mcmeta is at ZIP root,
-    # and only include datapack files (pack.mcmeta + data/)
-    pack_root = _get_pack_root(cfg, root)
-    pack_zip_name = f"{cfg['id']}-{cfg['version']}.zip"
-    pack_zip_path = out / pack_zip_name
+    pack_root     = _get_pack_root(manifest, root)
+    pack_zip_path = out / f"{manifest['id']}-{manifest['version']}.zip"
     with zipfile.ZipFile(pack_zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
         for file in pack_root.rglob("*"):
             if file.is_file() and not _should_exclude(file, pack_root):
                 zf.write(file, file.relative_to(pack_root))
     log(f"Main pack: {pack_zip_path.name}")
 
-def build_merged_zip(cfg: dict, resolved: dict, root: Path, token: str | None):
-    """Merge all packs into a single ZIP (namespace collision risk — warned)."""
+def build_merged_zip(manifest: dict, resolved: dict, root: Path, token: str | None):
     out = root / OUTPUT_DIR
     out.mkdir(parents=True, exist_ok=True)
 
-    merged_name = f"{cfg['id']}-{cfg['version']}-merged.zip"
-    merged_path = out / merged_name
-
-    seen_files: dict[str, str] = {}
+    merged_path = out / f"{manifest['id']}-{manifest['version']}-merged.zip"
+    seen: dict[str, str] = {}
     conflicts = []
 
     with zipfile.ZipFile(merged_path, "w", zipfile.ZIP_DEFLATED) as zf:
-        # Dependencies first
         for dep_id, info in resolved.items():
-            dep_zip_path = get_dep_zip(dep_id, info, root, token)
-            with zipfile.ZipFile(dep_zip_path) as dep_zip:
-                for name in dep_zip.namelist():
-                    if name in seen_files:
-                        conflicts.append(
-                            f"  CONFLICT: '{name}' ({seen_files[name]} ↔ {dep_id})"
-                        )
+            with zipfile.ZipFile(get_dep_zip(dep_id, info, root, token)) as dz:
+                for name in dz.namelist():
+                    if name in seen:
+                        conflicts.append(f"  CONFLICT: '{name}' ({seen[name]} ↔ {dep_id})")
                     else:
-                        seen_files[name] = dep_id
-                    zf.writestr(name, dep_zip.read(name))
+                        seen[name] = dep_id
+                    zf.writestr(name, dz.read(name))
 
-        # Main pack overrides dependencies — zip from pack_root (Bug 1+2 fix)
-        pack_root = _get_pack_root(cfg, root)
+        pack_root = _get_pack_root(manifest, root)
         for file in pack_root.rglob("*"):
             if file.is_file() and not _should_exclude(file, pack_root):
-                arc_name = str(file.relative_to(pack_root))
-                seen_files[arc_name] = f"{cfg['id']} (override)"
-                zf.write(file, arc_name)
+                arc = str(file.relative_to(pack_root))
+                seen[arc] = f"{manifest['id']} (override)"
+                zf.write(file, arc)
 
     if conflicts:
         warn("Namespace conflicts detected — main pack overrides:")
@@ -380,50 +327,17 @@ def build_merged_zip(cfg: dict, resolved: dict, root: Path, token: str | None):
 
     log(f"Merged ZIP: {merged_path.name}")
 
-def _get_pack_root(cfg: dict, root: Path) -> Path:
-    """
-    Return the directory that contains pack.mcmeta.
-    Checks config 'pack_root' field first, then searches for pack.mcmeta,
-    then falls back to root itself.
-    """
-    # Explicit config override
-    if "pack_root" in cfg:
-        return root / cfg["pack_root"]
+# ─── Submodule init ───────────────────────────────────────────────────────────
 
-    # Search for pack.mcmeta one level deep
-    for candidate in [root] + list(root.iterdir()):
-        if candidate.is_dir() and (candidate / "pack.mcmeta").exists():
-            if candidate != root:
-                log(f"Pack root detected: {candidate.relative_to(root)}/")
-            return candidate
-
-    return root
-
-def _should_exclude(file: Path, root: Path) -> bool:
-    rel   = file.relative_to(root)
-    parts = rel.parts
-    # Only include pack.mcmeta and data/ — everything else is repo metadata
-    allowed_roots = {"data", "pack.mcmeta"}
-    if parts[0] not in allowed_roots:
-        return True
-    excluded = {".git", ".github", ".dp-cache", "dist", "__pycache__"}
-    return parts[0] in excluded or parts[0].startswith(".")
-
-# ─── Submodule init helper ────────────────────────────────────────────────────
-
-def cmd_init_submodules(cfg: dict, root: Path):
-    """Add submodule dependencies via git submodule add."""
-    deps = cfg.get("dependencies", {})
+def cmd_init_submodules(deps: dict, root: Path):
     for dep_id, dep_cfg in deps.items():
-        if isinstance(dep_cfg, str):
-            continue
-        if dep_cfg.get("source") != "submodule":
+        if isinstance(dep_cfg, str) or dep_cfg.get("source") != "submodule":
             continue
         url = dep_cfg.get("url")
         if not url:
-            warn(f"[{dep_id}] Missing 'url' field — cannot add submodule")
+            warn(f"[{dep_id}] Missing 'url' — cannot add submodule")
             continue
-        path = dep_cfg.get("path", str(SUBMODULE_DIR / dep_id))
+        path     = dep_cfg.get("path", str(SUBMODULE_DIR / dep_id))
         abs_path = root / path
         if abs_path.exists():
             log(f"[{dep_id}] Already present: {path}")
@@ -431,90 +345,91 @@ def cmd_init_submodules(cfg: dict, root: Path):
         log(f"[{dep_id}] git submodule add {url} {path}")
         result = subprocess.run(
             ["git", "submodule", "add", url, path],
-            cwd=root, capture_output=True, text=True
+            cwd=root, capture_output=True, text=True,
         )
         if result.returncode != 0:
             die(f"git submodule add failed:\n{result.stderr}")
-
-# ─── Utilities ────────────────────────────────────────────────────────────────
-
-def log(msg: str):  print(f"[dp-resolve] {msg}")
-def warn(msg: str): print(f"[dp-resolve] WARNING: {msg}", file=sys.stderr)
-def die(msg: str):  print(f"[dp-resolve] ERROR: {msg}", file=sys.stderr); sys.exit(1)
 
 # ─── CLI ──────────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Datapack dependency manager",
+        description="Datapack dependency resolver",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Commands:
   resolve   Resolve dependencies and write lock file
-  build     Produce ZIP output(s)
-  init      Add submodule dependencies via git submodule add
-  check     Verify version constraints only (no ZIP output)
+  build     Resolve + produce ZIPs in dist/
+  init      Add submodule deps via git submodule add
+  check     Verify version constraints only (no output)
 
 Examples:
-  dp-resolve resolve --mode prod
-  dp-resolve build --output separate
-  dp-resolve build --output merged
-  dp-resolve build --mode dev --output both
+  dp-resolve.py resolve --mode prod
+  dp-resolve.py build --output both
+  dp-resolve.py build --mode dev --output separate
         """,
     )
     parser.add_argument("command", choices=["resolve", "build", "init", "check"])
-    parser.add_argument(
-        "--mode", choices=["prod", "dev", "auto"], default="auto",
-        help="prod=GitHub releases  dev=submodule  auto=per-dep source field"
-    )
-    parser.add_argument(
-        "--output", choices=["separate", "merged", "both"], default="separate",
-        help="ZIP output mode (build command only)"
-    )
-    parser.add_argument(
-        "--config", default=CONFIG_FILE,
-        help=f"Config file path (default: {CONFIG_FILE})"
-    )
-    parser.add_argument(
-        "--root", default=".",
-        help="Project root directory (default: .)"
-    )
-    parser.add_argument(
-        "--token", default=os.environ.get("GITHUB_TOKEN"),
-        help="GitHub API token (default: $GITHUB_TOKEN env var)"
-    )
+    parser.add_argument("--mode",   choices=["prod", "dev", "auto"], default="auto")
+    parser.add_argument("--output", choices=["separate", "merged", "both"], default="separate")
+    parser.add_argument("--root",   default=".", help="Project root directory")
+    parser.add_argument("--token",  default=os.environ.get("GITHUB_TOKEN"))
     args = parser.parse_args()
 
-    root = Path(args.root).resolve()
-    cfg  = load_config(root / args.config)
+    root     = Path(args.root).resolve()
+    manifest = load_manifest(root)
+    deps     = load_all_deps(root)
 
-    log(f"Project: {cfg['id']} v{cfg['version']}")
+    log(f"Project: {manifest['id']} v{manifest['version']}")
 
     if args.command == "init":
-        cmd_init_submodules(cfg, root)
+        cmd_init_submodules(deps, root)
         return
-
-    resolved = resolve_all(cfg, root, args.mode, args.token)
 
     if args.command == "check":
-        if resolved:
-            log("Version check passed:")
-            for dep_id, info in resolved.items():
-                log(f"  {dep_id}: {info['version']} ({info['source']})")
-        else:
+        # No network — validate constraints against what's in the lock file
+        lock          = load_lock(root)
+        resolved_lock = lock.get("resolved", {})
+        ok = True
+        for dep_id, dep_cfg in deps.items():
+            if isinstance(dep_cfg, str):
+                dep_cfg = {"version": dep_cfg}
+            constraint = dep_cfg.get("version", "*")
+            lock_entry = resolved_lock.get(dep_id)
+            if lock_entry:
+                locked_ver = lock_entry.get("version", "unknown")
+                try:
+                    matches = version_matches(locked_ver, constraint)
+                except ValueError as e:
+                    warn(f"  {dep_id}: bad constraint '{constraint}': {e}")
+                    ok = False
+                    continue
+                status = "OK" if matches else "FAIL"
+                if not matches:
+                    ok = False
+                log(f"  {status}  {dep_id}: locked v{locked_ver} vs '{constraint}'")
+            else:
+                log(f"  ??   {dep_id}: not in lock file (run 'resolve' first)")
+        if not deps:
             log("No dependencies declared.")
+        elif ok:
+            log("All constraints satisfied.")
+        else:
+            die("One or more constraint checks failed.")
         return
 
+    resolved = resolve_all(deps, root, args.mode, args.token)
+
     if args.command in ("resolve", "build"):
-        lock = {"resolved": resolved}
-        save_lock(root, lock)
+        save_lock(root, {"resolved": resolved})
+        log(f"Lock file updated: {LOCK_FILE}")
 
     if args.command == "build":
         log(f"Output mode: {args.output}")
         if args.output in ("separate", "both"):
-            build_separate_zips(cfg, resolved, root, args.token)
+            build_separate_zips(manifest, resolved, root, args.token)
         if args.output in ("merged", "both"):
-            build_merged_zip(cfg, resolved, root, args.token)
+            build_merged_zip(manifest, resolved, root, args.token)
 
     log("Done.")
 
