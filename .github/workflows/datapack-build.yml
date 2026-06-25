@@ -32,29 +32,27 @@ env:
   DEFAULT_OUTPUT: "both"
 
 jobs:
-  # ─── 1. Dependency check (fast feedback on PRs) ───────────────────────────
+  # ─── 1. Dependency check (fast feedback on PRs, no network) ──────────────
   dep-check:
     name: Dependency Check
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request'
     steps:
-      - name: Checkout (with submodules)
+      - name: Checkout
         uses: actions/checkout@v4
         with:
           submodules: recursive
           fetch-depth: 0
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      - name: Check dependency versions
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          python scripts/dp-resolve.py check \
-            --mode ${{ github.event.inputs.mode || env.DEFAULT_MODE }}
+      # check reads .depends/ and validates constraints against the lock file.
+      # No network calls — GITHUB_TOKEN not required here.
+      - name: Check constraints against lock file
+        run: python scripts/dp-resolve.py check
 
   # ─── 2. Build (tag push or manual trigger) ───────────────────────────────
   build:
@@ -66,7 +64,7 @@ jobs:
       pack-version: ${{ steps.meta.outputs.pack_version }}
     steps:
       - name: Checkout (with submodules)
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
         with:
           submodules: recursive
           fetch-depth: 0
@@ -76,8 +74,9 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      - name: Cache dependencies
-        uses: actions/cache@v5
+      # Cache key uses the lock file — cache is invalidated when deps change
+      - name: Cache .dp-cache
+        uses: actions/cache@v4
         with:
           path: .dp-cache
           key: dp-cache-${{ runner.os }}-${{ hashFiles('datapack_depends.lock') }}
@@ -92,13 +91,36 @@ jobs:
             --mode   ${{ github.event.inputs.mode   || env.DEFAULT_MODE }} \
             --output ${{ github.event.inputs.output || env.DEFAULT_OUTPUT }}
 
+      # Read id and version from .depends/manifest.json
       - name: Read pack metadata
         id: meta
         run: |
-          PACK_ID=$(python -c "import json; print(json.load(open('datapack_depends.json'))['id'])")
-          PACK_VER=$(python -c "import json; print(json.load(open('datapack_depends.json'))['version'])")
-          echo "pack_id=$PACK_ID"       >> "$GITHUB_OUTPUT"
-          echo "pack_version=$PACK_VER" >> "$GITHUB_OUTPUT"
+          python - << 'PYEOF'
+          import json, os, pathlib, sys
+
+          root = pathlib.Path(".")
+
+          # .depends/manifest.json (primary)
+          manifest_path = root / ".depends" / "manifest.json"
+          if manifest_path.exists():
+              data = json.loads(manifest_path.read_text())
+          else:
+              # Fallback: legacy datapack_depends.json
+              legacy = root / "datapack_depends.json"
+              if not legacy.exists():
+                  print("ERROR: no manifest.json or datapack_depends.json", file=sys.stderr)
+                  sys.exit(1)
+              data = json.loads(legacy.read_text())
+
+          pack_id  = data["id"]
+          pack_ver = data["version"]
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"pack_id={pack_id}\n")
+              f.write(f"pack_version={pack_ver}\n")
+
+          print(f"Pack: {pack_id} v{pack_ver}")
+          PYEOF
 
       - name: Commit lock file (tag push only)
         if: startsWith(github.ref, 'refs/tags/')
@@ -110,7 +132,7 @@ jobs:
           git push origin HEAD:${{ github.event.repository.default_branch }} || true
 
       - name: Upload build artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v4
         with:
           name: datapack-dist-${{ steps.meta.outputs.pack_version }}
           path: dist/
@@ -126,7 +148,7 @@ jobs:
       contents: write
     steps:
       - name: Download build artifact
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v4
         with:
           name: datapack-dist-${{ needs.build.outputs.pack-version }}
           path: dist/
@@ -139,7 +161,7 @@ jobs:
           echo "EOF"       >> "$GITHUB_OUTPUT"
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
           name: "${{ needs.build.outputs.pack-id }} ${{ github.ref_name }}"
@@ -152,13 +174,13 @@ jobs:
             your server's `world/datapacks/` folder, then run `/reload`.
 
             **Merged ZIP:** Use `*-merged.zip` as a single standalone datapack.
-            Note: namespace conflicts between dependencies are resolved by the
-            main pack taking priority. Check build logs for any warnings.
+            Namespace conflicts are resolved by the main pack taking priority —
+            check build logs for warnings.
 
             ### Dependencies
 
-            All dependency ZIPs are included in this release — no manual
-            installation of dependencies required when using separate ZIPs.
+            All dependency ZIPs are included in this release.
+            No manual dependency installation required when using separate ZIPs.
           draft: false
           prerelease: ${{ contains(github.ref_name, '-') }}
           files: ${{ steps.zips.outputs.files }}
