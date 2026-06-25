@@ -51,7 +51,7 @@ jobs:
           git checkout -b "$BRANCH"
           git add datapack_depends.lock
           git commit -m "chore(deps): update lock file ($(date +%Y-%m-%d))"
-          git push origin "$BRANCH"
+          git push origin "$BRANCH" --force
 
           REPO="${GITHUB_REPOSITORY}"
           COMPARE_URL="https://github.com/${REPO}/compare/main...${BRANCH}?expand=1"
@@ -61,7 +61,7 @@ jobs:
             --title "chore(deps): dependency update $(date +%Y-%m-%d)" \
             --body "Scheduled dependency check — lock file updated on branch \`${BRANCH}\`.
 
-          PR'ı GitHub Actions açamıyor (org policy: \"Allow GitHub Actions to create and approve pull requests\" kapalı). Aşağıdaki linke tıklayıp PR'ı manuel oluştur:
+          GitHub Actions cannot open the PR (org policy: \"Allow GitHub Actions to create and approve pull requests\" is disabled). Click the link below to create the PR manually:
 
           ${COMPARE_URL}
 
