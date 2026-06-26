@@ -8,11 +8,10 @@
   },
 
   "dependencies": {
-    "dataLib": {
-      "source": "github",
-      "repo": "runtoolkit/dataLib",
-      "version": ">=v6.0.0",
-      "asset": "dataLib-full.zip"
+    "data_api": {
+      "source": "modrinth",
+      "project": "ZS3lIxKu",
+      "version": ">=1.8.5"
     }
   }
 }

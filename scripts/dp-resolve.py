@@ -158,16 +158,66 @@ def resolve_github(dep_id: str, dep_cfg: dict, token: str | None) -> dict:
 
 def resolve_modrinth(dep_id: str, dep_cfg: dict) -> dict:
     """
-    dep_cfg:
-      { "source": "modrinth", "project": "datalib", "version": ">=6.0.0" }
+    dep_cfg — three usage modes:
+
+    1. Pinned version_id (no API call):
+       { "source": "modrinth", "project": "ZS3lIxKu",
+         "version_id": "dtMspp4A", "version": "dtMspp4A",
+         "asset": "data_api.zip",
+         "download_url": "https://cdn.modrinth.com/..." }
+
+    2. Pinned version_id, resolve asset via API:
+       { "source": "modrinth", "project": "ZS3lIxKu",
+         "version_id": "dtMspp4A", "version": "dtMspp4A" }
+
+    3. Constraint-based (resolves latest matching):
+       { "source": "modrinth", "project": "datalib", "version": ">=6.0.0" }
     """
     project    = dep_cfg["project"]
-    constraint = dep_cfg["version"]
+    version_id = dep_cfg.get("version_id")
+    dl_url     = dep_cfg.get("download_url")
+    asset_name = dep_cfg.get("asset", f"{dep_id}.zip")
+    headers    = {"User-Agent": "dp-depman/1.0 (github.com/runtoolkit)"}
 
+    # Mode 1: direct URL provided — skip all API calls
+    if version_id and dl_url:
+        log(f"[{dep_id}] Modrinth: pinned {version_id} (direct URL)")
+        return {
+            "source":       "modrinth",
+            "project":      project,
+            "version":      version_id,
+            "asset_name":   asset_name,
+            "download_url": dl_url,
+            "sha256":       dep_cfg.get("sha256"),
+            "_dl_headers":  headers,
+        }
+
+    # Mode 2: pinned version_id, fetch asset URL from API
+    if version_id:
+        log(f"[{dep_id}] Modrinth: fetching version {version_id}")
+        v = json.loads(_http_get(
+            f"https://api.modrinth.com/v2/version/{version_id}", headers
+        ))
+        files = v.get("files", [])
+        zf = next((f for f in files if f.get("filename", "").endswith(".zip")), None)
+        if not zf:
+            die(f"[{dep_id}] No ZIP in Modrinth version {version_id}")
+        log(f"  → {zf['filename']}")
+        return {
+            "source":       "modrinth",
+            "project":      project,
+            "version":      version_id,
+            "asset_name":   zf["filename"],
+            "download_url": zf["url"],
+            "sha256":       zf.get("hashes", {}).get("sha256"),
+            "_dl_headers":  headers,
+        }
+
+    # Mode 3: constraint-based — resolve latest matching version
+    constraint = dep_cfg.get("version", "*")
     log(f"[{dep_id}] Modrinth: {project} ({constraint})")
     versions = json.loads(_http_get(
-        f"https://api.modrinth.com/v2/project/{project}/version",
-        {"User-Agent": "dp-depman/1.0 (github.com/runtoolkit)"},
+        f"https://api.modrinth.com/v2/project/{project}/version", headers
     ))
 
     candidates = []
@@ -186,14 +236,10 @@ def resolve_modrinth(dep_id: str, dep_cfg: dict) -> dict:
     chosen_ver, chosen_v = candidates[0]
     log(f"  → v{chosen_ver} selected")
 
-    # Pick first .zip file from files list
     files = chosen_v.get("files", [])
-    zf = next(
-        (f for f in files if f.get("filename", "").endswith(".zip")),
-        None,
-    )
+    zf = next((f for f in files if f.get("filename", "").endswith(".zip")), None)
     if not zf:
-        die(f"[{dep_id}] No ZIP file in Modrinth version {chosen_ver}")
+        die(f"[{dep_id}] No ZIP in Modrinth version {chosen_ver}")
 
     return {
         "source":       "modrinth",
@@ -202,7 +248,7 @@ def resolve_modrinth(dep_id: str, dep_cfg: dict) -> dict:
         "asset_name":   zf["filename"],
         "download_url": zf["url"],
         "sha256":       zf.get("hashes", {}).get("sha256"),
-        "_dl_headers":  {"User-Agent": "dp-depman/1.0"},
+        "_dl_headers":  headers,
     }
 
 # ─── CurseForge resolution ────────────────────────────────────────────────────
@@ -317,6 +363,39 @@ def resolve_submodule(dep_id: str, dep_cfg: dict, root: Path) -> dict:
     log(f"  → {dep_id} submodule v{detected_ver} ({rel_path})")
     return {"source": "submodule", "path": rel_path, "version": detected_ver}
 
+# ─── Direct URL resolution ───────────────────────────────────────────────────
+
+def resolve_url(dep_id: str, dep_cfg: dict) -> dict:
+    """
+    dep_cfg:
+      {
+        "source":     "url",
+        "url":        "https://cdn.modrinth.com/...",
+        "version":    "1.0.0",
+        "asset_name": "data_api.zip"   ← optional, inferred from URL if absent
+      }
+    """
+    url     = dep_cfg.get("url")
+    version = dep_cfg.get("version", "unknown")
+
+    if not url:
+        die(f"[{dep_id}] Missing 'url' for source=url")
+
+    # Infer asset_name from URL path (strip query string)
+    asset_name = dep_cfg.get("asset_name") or url.split("?")[0].split("/")[-1]
+    if not asset_name.endswith(".zip"):
+        asset_name = f"{dep_id}-{version}.zip"
+
+    log(f"[{dep_id}] URL: {url[:80]}{'...' if len(url) > 80 else ''}")
+    return {
+        "source":       "url",
+        "version":      version,
+        "asset_name":   asset_name,
+        "download_url": url,
+        "sha256":       dep_cfg.get("sha256"),
+        "_dl_headers":  {},
+    }
+
 # ─── Resolution dispatcher ────────────────────────────────────────────────────
 
 def resolve_all(deps: dict, root: Path, mode: str, tokens: dict) -> dict:
@@ -341,7 +420,7 @@ def resolve_all(deps: dict, root: Path, mode: str, tokens: dict) -> dict:
         if mode == "dev":
             effective = "submodule"
         elif mode == "prod":
-            effective = source if source in ("github", "modrinth", "curseforge") else "github"
+            effective = source if source in ("github", "modrinth", "curseforge", "url") else "github"
         else:
             effective = source  # auto
 
@@ -362,6 +441,9 @@ def resolve_all(deps: dict, root: Path, mode: str, tokens: dict) -> dict:
 
         elif effective == "submodule":
             info = resolve_submodule(dep_id, dep_cfg, root)
+
+        elif effective == "url":
+            info = resolve_url(dep_id, dep_cfg)
 
         else:
             die(f"[{dep_id}] Unknown source: '{effective}'")
