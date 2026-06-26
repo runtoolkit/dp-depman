@@ -1,28 +1,17 @@
 {
-  "id": "examplePack",
+  "id": "example-pack",
   "version": "1.0.0",
   "description": "Example datapack dependency config",
 
   "build": {
-    "output": "both",
-    "exclude": [
-      ".git",
-      ".github",
-      ".dp-cache",
-      "dist",
-      "datapack_depends.json",
-      "datapack_depends.lock",
-      "*.md",
-      "scripts/"
-    ]
+    "output": "both"
   },
 
   "dependencies": {
-    "dataLib": {
-      "source": "github",
-      "repo": "runtoolkit/dataLib",
-      "version": ">=v6.0.0",
-      "asset": "dataLib-full.zip"
+    "data_api": {
+      "source": "modrinth",
+      "project": "ZS3lIxKu",
+      "version": ">=1.8.5"
     }
   }
 }

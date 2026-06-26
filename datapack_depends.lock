@@ -1,12 +1,12 @@
 {
   "resolved": {
-    "dataLib": {
-      "source": "github",
-      "repo": "runtoolkit/dataLib",
-      "version": "6.0.0",
-      "asset_name": "dataLib-full.zip",
-      "download_url": "https://github.com/runtoolkit/dataLib/releases/download/v6.0.0/dataLib.zip",
-      "sha256": "c2f5cf679ce371b943b26998f0bfc803f0f1b4ba885aca4cd012b2c12df9629a"
+    "data_api": {
+      "source": "modrinth",
+      "project": "ZS3lIxKu",
+      "version": "1.8.5",
+      "asset_name": "data_api.zip",
+      "download_url": "https://cdn.modrinth.com/data/ZS3lIxKu/versions/dtMspp4A/data_api.zip?mr_download_reason=standalone",
+      "sha256": null
     }
   }
 }
