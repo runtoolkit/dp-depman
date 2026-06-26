@@ -52,12 +52,16 @@ def load_manifest(root: Path) -> dict:
     legacy = root / CONFIG_FILE
     if legacy.exists():
         data = _read_json(legacy)
-        # Extract only identity fields
-        return {
+        # Extract only identity fields (+ build.output, if declared)
+        manifest = {
             "id":          data.get("id", "unknown"),
             "version":     data.get("version", "0.0.0"),
             "description": data.get("description", ""),
         }
+        build_cfg = data.get("build", {})
+        if isinstance(build_cfg, dict) and "output" in build_cfg:
+            manifest["output"] = build_cfg["output"]
+        return manifest
 
     die(
         f"No manifest found. Create .depends/manifest.json or {CONFIG_FILE}.\n"

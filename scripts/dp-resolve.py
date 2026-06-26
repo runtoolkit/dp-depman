@@ -526,23 +526,19 @@ def _pack_files(pack_root: Path):
 
 # ─── Build ────────────────────────────────────────────────────────────────────
 
-def build_pack_zip(manifest: dict, resolved: dict, root: Path) -> Path:
+def _build_merged_zip(manifest: dict, resolved: dict, root: Path, pack_root: Path, out: Path) -> Path:
     """
     Produce a single self-contained ZIP:
 
-      <id>-<version>.zip
+      <id>-<version>-merged.zip
       ├── pack.mcmeta
       ├── data/
       └── .depends/
           ├── manifest.json
           └── <dep_id>-<version>.zip   (one per dependency)
     """
-    out = root / OUTPUT_DIR
-    out.mkdir(parents=True, exist_ok=True)
-
-    pack_root = _get_pack_root(manifest, root)
-    zip_name  = f"{manifest['id']}-{manifest['version']}.zip"
-    zip_path  = out / zip_name
+    zip_name = f"{manifest['id']}-{manifest['version']}-merged.zip"
+    zip_path = out / zip_name
 
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
         # 1. Pack files (pack.mcmeta + data/)
@@ -570,6 +566,59 @@ def build_pack_zip(manifest: dict, resolved: dict, root: Path) -> Path:
 
     log(f"Output: {zip_path.name}")
     return zip_path
+
+
+def _build_separate_zips(manifest: dict, resolved: dict, root: Path, pack_root: Path, out: Path) -> list[Path]:
+    """
+    Produce one ZIP per pack (main pack + each dependency), meant to be
+    dropped side-by-side into world/datapacks/. No embedding/merging.
+
+      <id>-<version>.zip            (main pack only — pack.mcmeta + data/)
+      <dep_id>-<version>.zip        (one per dependency, copied as-is)
+    """
+    paths = []
+
+    main_zip_name = f"{manifest['id']}-{manifest['version']}.zip"
+    main_zip_path = out / main_zip_name
+    with zipfile.ZipFile(main_zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for file, arc in _pack_files(pack_root):
+            zf.write(file, arc)
+    log(f"Output: {main_zip_path.name}")
+    paths.append(main_zip_path)
+
+    for dep_id, info in resolved.items():
+        dep_zip_path = get_dep_zip(dep_id, info, root)
+        dest_name    = f"{dep_id}-{info['version']}.zip"
+        dest_path    = out / dest_name
+        shutil.copyfile(dep_zip_path, dest_path)
+        log(f"Output: {dest_path.name}")
+        paths.append(dest_path)
+
+    return paths
+
+
+def build_pack_zip(manifest: dict, resolved: dict, root: Path, output_mode: str = "merged") -> list[Path]:
+    """
+    Produce build output(s) in dist/ according to output_mode:
+
+      merged    — single self-contained ZIP with deps embedded under .depends/
+      separate  — one ZIP per pack (main + each dep), no embedding
+      both      — produce both of the above
+
+    Returns the list of produced ZIP paths.
+    """
+    out = root / OUTPUT_DIR
+    out.mkdir(parents=True, exist_ok=True)
+
+    pack_root = _get_pack_root(manifest, root)
+
+    produced: list[Path] = []
+    if output_mode in ("merged", "both"):
+        produced.append(_build_merged_zip(manifest, resolved, root, pack_root, out))
+    if output_mode in ("separate", "both"):
+        produced.extend(_build_separate_zips(manifest, resolved, root, pack_root, out))
+
+    return produced
 
 # ─── Submodule init ───────────────────────────────────────────────────────────
 
@@ -616,12 +665,16 @@ Sources:
 Examples:
   dp-resolve.py build --mode prod
   dp-resolve.py build --mode dev
+  dp-resolve.py build --mode prod --output both
   dp-resolve.py resolve --mode prod
   dp-resolve.py check
         """,
     )
     parser.add_argument("command", choices=["resolve", "build", "init", "check"])
-    parser.add_argument("--mode",  choices=["prod", "dev", "auto"], default="auto")
+    parser.add_argument("--mode",   choices=["prod", "dev", "auto"], default="auto")
+    parser.add_argument("--output", choices=["separate", "merged", "both"], default=None,
+                        help="build: ZIP output mode (default: manifest's build.output, "
+                             "else 'merged')")
     parser.add_argument("--root",  default=".")
     parser.add_argument("--token", default=os.environ.get("GITHUB_TOKEN"),
                         help="GitHub token (default: $GITHUB_TOKEN)")
@@ -685,7 +738,8 @@ Examples:
         log(f"Lock file updated.")
 
     if args.command == "build":
-        build_pack_zip(manifest, resolved, root)
+        output_mode = args.output or manifest.get("output") or "merged"
+        build_pack_zip(manifest, resolved, root, output_mode)
 
     log("Done.")
 
